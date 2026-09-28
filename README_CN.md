@@ -259,17 +259,51 @@ npx electron-builder --linux --arm64
 
 ### 触发方式
 
-1. **推送标签**: 推送 `v*` 格式的标签时自动构建并发布
+1. **改版本号**: 修改 `Kiro-account-manager/package.json` 的 `version` 并推送到 `main` —— 若 `v{version}` tag 尚不存在则自动构建全平台并发布（普通提交会跳过）
+2. **推送标签**: 推送 `v*` 格式的标签时自动构建并发布
    ```bash
    git tag v1.1.0
    git push origin v1.1.0
    ```
 
-2. **手动触发**: 在 GitHub Actions 页面手动运行工作流
+3. **手动触发**: 在 GitHub Actions 页面手动运行工作流（总是构建）
 
 ---
 
 ## 📋 更新日志
+
+### v1.7.7 (2026-9-28) — Kiro API 区域路由 + 按模型选号 + 去除静默降级 + Claude Opus 5.5
+
+#### 🌍 区域路由
+
+- **新增**：`regionResolver.ts` 统一 Kiro API 区域决策：真实 `profileArn` 区域 > SSO 区域映射 > `us-east-1`，共享占位 ARN 不参与决策
+- **修复**：🔥 反代流式端点（`generateAssistantResponse` / `SendMessageStreaming`）写死 `us-east-1` —— EU profile 账号现在走 `eu-central-1`
+- **新增**：区域为推断值（非真实 ARN）时 403 会换另一个 Kiro 部署区域重试一次（封禁 / token 类 403 不重试）
+- **修复**：`ListAvailableModels` / `GetUsageLimits` 共用同一区域逻辑；Enterprise 多 profile 优先选本区域的，而不是固定取第一个
+- **安全**：拼接 URL 前校验区域格式，防止导入的脏 ARN 造成 host 注入
+
+#### 🎯 按模型选号
+
+- **修复**：🔥 **去除静默降级** —— CodeWhisperer 端点下账号模型列表没有请求的模型时，会被偷偷换成 `CLAUDE_SONNET_4`（客户端要 Opus 实际拿到 Sonnet 4）。现在返回 `MODEL_NOT_AVAILABLE`
+- **新增**：多账号模式只从模型列表含该模型的账号中选（5 分钟缓存，单请求最多探测 5 个号）；Free/Pro 混合号池的 Opus 请求只会落到 Pro 号
+- **新增**：所有账号都没有该模型 → HTTP 400 `MODEL_NOT_AVAILABLE`，不计账号错误、不进冷却
+- **修复**：模型匹配改为「家族 + 有序版本号」比较（修复 `opus-5.5 → opus-4.5`、`sonnet-4 → sonnet-4.5` 误匹配）
+
+#### 🧠 Claude Opus 5.5
+
+- **新增**：别名 `claude-opus-5-5` / `claude-opus-5.5`；剥离 Claude Code 的 `[1m]` 后缀
+- **新增**：静态模型列表 / 诊断页加入 Opus 5.5；上下文长度兜底覆盖 5.x（`[1m]` → 1M）
+- **修复**：thinking 配置支持别名匹配（如 `claude-opus-4-6`）
+- **修复**：effort 档位不支持时取最接近的一档（平局取更便宜的），不再直接取最贵档
+- **修复**：一键配置 Claude Code 选最新版本的 Opus / Haiku
+
+#### 🔧 其他
+
+- **修复**：非流式请求忽略「首选端点」配置
+- **新增**：`npm run test:unit`（node --test，26 个用例，含真实 ProxyServer + 伪造 Kiro 后端的路由测试）
+- **CI**：Build & Release 改为自动触发 —— push 到 `main` 且 `package.json` 版本号尚无对应 tag 时自动构建发布（也支持推 `v*` tag 和手动触发）；单元测试不通过不发布
+
+---
 
 
 ### v1.7.5 (2026-6-7) — 思考模式支持 + Enterprise profileArn 完整修复 + Agent 模式与 Steering + 工具调用泄漏修复

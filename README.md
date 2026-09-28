@@ -259,18 +259,52 @@ The project is configured with GitHub Actions workflow for auto building all pla
 
 ### Trigger Methods
 
-1. **Push Tag**: Auto build and release when pushing `v*` format tags
+1. **Bump version**: Change `version` in `Kiro-account-manager/package.json` and push to `main` — if tag `v{version}` doesn't exist yet, all platforms are built and released automatically (ordinary pushes are skipped)
+2. **Push Tag**: Auto build and release when pushing `v*` format tags
    ```bash
    git tag v1.1.0
    git push origin v1.1.0
    ```
 
-2. **Manual Trigger**: Manually run workflow in GitHub Actions page
+3. **Manual Trigger**: Manually run workflow in GitHub Actions page (always builds)
 
 ---
 
 ## 📋 Changelog
 
+
+### v1.7.7 (2026-9-28) — Kiro API Region Routing + Model-Aware Account Selection + No Silent Downgrade + Claude Opus 5.5
+
+#### 🌍 Region Routing
+
+- **New**: `regionResolver.ts` — single source of truth for the Kiro API region: real `profileArn` region > SSO-region mapping > `us-east-1`; shared placeholder ARNs are ignored
+- **Fix**: 🔥 Proxy streaming endpoints (`generateAssistantResponse` / `SendMessageStreaming`) were hardcoded to `us-east-1` — EU-profile accounts now go to `eu-central-1`
+- **New**: When the region is only inferred (not from a real ARN), a 403 is retried once against the other Kiro region (suspension / token 403s are not retried)
+- **Fix**: `ListAvailableModels` / `GetUsageLimits` share the same region logic; Enterprise accounts with multiple profiles prefer the one in their own region instead of always the first
+- **Security**: Region is validated before being put into a URL (prevents host injection via malformed imported ARNs)
+
+#### 🎯 Model-Aware Account Selection
+
+- **Fix**: 🔥 **Silent downgrade removed** — on the CodeWhisperer endpoint, a model missing from the account's model list was silently replaced by `CLAUDE_SONNET_4` (client asked for Opus, got Sonnet 4). Now it raises `MODEL_NOT_AVAILABLE`
+- **New**: Multi-account mode only selects accounts whose model list contains the requested model (5-min cache, max 5 probes per request); mixed Free/Pro pools route Opus requests to Pro accounts only
+- **New**: If no account has the model → HTTP 400 `MODEL_NOT_AVAILABLE`; not counted as an account error, no cooldown
+- **Fix**: Model matching now compares family + ordered version (fixes `opus-5.5 → opus-4.5` and `sonnet-4 → sonnet-4.5` mismatches)
+
+#### 🧠 Claude Opus 5.5
+
+- **New**: Aliases `claude-opus-5-5` / `claude-opus-5.5`; Claude Code `[1m]` suffix is stripped
+- **New**: Opus 5.5 added to static model lists / diagnostics; context-length fallback covers 5.x (`[1m]` → 1M)
+- **Fix**: Thinking config lookup now works with aliases (e.g. `claude-opus-4-6`)
+- **Fix**: Unsupported effort level maps to the nearest level (ties → cheaper) instead of the most expensive
+- **Fix**: One-click Claude Code config picks the newest Opus / Haiku version
+
+#### 🔧 Other
+
+- **Fix**: Non-streaming requests ignored the `preferredEndpoint` setting
+- **New**: `npm run test:unit` (node --test, 26 cases incl. real ProxyServer + fake Kiro backend routing tests)
+- **CI**: Build & Release now runs automatically on push to `main` when the `package.json` version has no tag yet (plus on `v*` tag push and manual trigger); unit tests gate the release
+
+---
 
 ### v1.7.5 (2026-6-7) — Thinking Mode + Enterprise profileArn Full Fix + Agent Mode & Steering + Tool Use Leak Fix
 
