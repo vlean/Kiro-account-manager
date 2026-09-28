@@ -113,7 +113,9 @@ jobs:
   build-windows:
     needs: get-version
     if: needs.get-version.outputs.should_build == 'true'
-    runs-on: windows-latest
+    # windows-latest 已切到 windows-2025-vs2026 镜像，node-gyp 9.x 识别不了 VS2026，
+    # cbor-extract 原生模块编译失败；固定用带 VS2022 的镜像
+    runs-on: windows-2022
     strategy:
       matrix:
         arch: [x64, ia32]
@@ -164,7 +166,9 @@ jobs:
   build-windows-arm64:
     needs: get-version
     if: needs.get-version.outputs.should_build == 'true'
-    runs-on: windows-latest
+    # windows-latest 已切到 windows-2025-vs2026 镜像，node-gyp 9.x 识别不了 VS2026，
+    # cbor-extract 原生模块编译失败；固定用带 VS2022 的镜像
+    runs-on: windows-2022
     steps:
       - name: Checkout
         uses: actions/checkout@v4
