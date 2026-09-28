@@ -23,8 +23,10 @@ import {
   parseAccessTokenClaims,
   watchKiroAuthTokenFile,
   resolveProfileArnForWrite,
+  resolveAccountApiRegion,
   KIRO_AUTH_TOKEN_PATH
 } from './kiroAuthSync'
+import { getAlternateApiRegion, getQServiceBaseUrl } from './regionResolver'
 import { openaiToKiro } from './proxy/translator'
 import { getSystemProxy, safeCreateProxyAgent } from './proxy/systemProxy'
 import { proxyLogStore, interceptConsole } from './proxy/logger'
@@ -99,30 +101,15 @@ function setupAutoUpdater(): void {
 
 // ============ Kiro API 调用 ============
 const KIRO_API_BASE = 'https://app.kiro.dev/service/KiroWebPortalService/operation'
-// REST API 端点配置 - 官方 Kiro 插件仅支持 us-east-1 和 eu-central-1
-const KIRO_REST_API_ENDPOINTS: Record<string, string> = {
-  'us-east-1': 'https://q.us-east-1.amazonaws.com',
-  'eu-central-1': 'https://q.eu-central-1.amazonaws.com'
+// REST API 端点：区域决策统一走 regionResolver（真实 profileArn 区域 > SSO 区域映射 > us-east-1）
+function getRestApiBase(ssoRegion?: string, profileArn?: string): string {
+  return getQServiceBaseUrl(resolveAccountApiRegion({ region: ssoRegion, profileArn }).region)
 }
 
-// 根据 SSO 区域映射到最近的 REST API 端点
-function getRestApiBase(ssoRegion?: string): string {
-  if (!ssoRegion) return KIRO_REST_API_ENDPOINTS['us-east-1']
-  // 如果是支持的端点区域，直接使用
-  if (KIRO_REST_API_ENDPOINTS[ssoRegion]) return KIRO_REST_API_ENDPOINTS[ssoRegion]
-  // EU 区域映射到 eu-central-1
-  if (ssoRegion.startsWith('eu-')) return KIRO_REST_API_ENDPOINTS['eu-central-1']
-  // 其他区域默认 us-east-1
-  return KIRO_REST_API_ENDPOINTS['us-east-1']
-}
-
-// 获取备用 REST API 端点（用于 fallback）
-function getFallbackRestApiBase(ssoRegion?: string): string {
-  const primary = getRestApiBase(ssoRegion)
-  // 返回另一个端点作为 fallback
-  return primary === KIRO_REST_API_ENDPOINTS['eu-central-1']
-    ? KIRO_REST_API_ENDPOINTS['us-east-1']
-    : KIRO_REST_API_ENDPOINTS['eu-central-1']
+// 获取备用 REST API 端点（用于 403 fallback：在两个 Kiro 部署区域之间切换）
+function getFallbackRestApiBase(ssoRegion?: string, profileArn?: string): string {
+  const primary = resolveAccountApiRegion({ region: ssoRegion, profileArn }).region
+  return getQServiceBaseUrl(getAlternateApiRegion(primary) || 'us-east-1')
 }
 
 // API 类型配置
@@ -1179,8 +1166,8 @@ async function getUsageLimitsRest(
   const path = `/getUsageLimits?${params.toString()}`
   
   // 根据 SSO 区域选择主端点
-  const primaryBase = getRestApiBase(ssoRegion)
-  const fallbackBase = getFallbackRestApiBase(ssoRegion)
+  const primaryBase = getRestApiBase(ssoRegion, profileArn)
+  const fallbackBase = getFallbackRestApiBase(ssoRegion, profileArn)
   
   let response = await fetchRestApi(primaryBase, path, accessToken, machineId)
   

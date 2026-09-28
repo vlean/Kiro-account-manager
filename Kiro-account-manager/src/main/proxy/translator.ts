@@ -29,6 +29,7 @@ import type {
 } from './types'
 import { buildKiroPayload, mapModelId } from './kiroApi'
 import { ToolNameRegistry } from './toolNameRegistry'
+import { pickNearestEffort } from './modelSupport'
 
 const KIRO_CACHE_POINT: KiroCachePoint = { type: 'default' }
 
@@ -85,10 +86,9 @@ function buildThinkingFields(
     effort = thinkingConfig.defaultEffort || 'high'
   }
 
-  // 确保 effort 在可用范围内，否则取最接近的
-  if (!thinkingConfig.efforts.includes(effort)) {
-    effort = thinkingConfig.efforts[thinkingConfig.efforts.length - 1] || 'high'
-  }
+  // 确保 effort 在可用范围内，否则取最接近的一档（平局取更低档）
+  // 旧实现直接取列表最后一个（通常是最贵的档位），请求 low 反而按最高档跑
+  effort = pickNearestEffort(effort, thinkingConfig.efforts, thinkingConfig.defaultEffort || 'high')
 
   switch (thinkingConfig.schemaPath) {
     case 'output_config':

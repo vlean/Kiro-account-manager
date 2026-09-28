@@ -18,6 +18,7 @@ import * as fsSync from 'fs'
 import * as path from 'path'
 import * as os from 'os'
 import * as crypto from 'crypto'
+import { mapSsoRegionToApiRegion, resolveKiroApiRegion, type ResolvedRegion } from './regionResolver'
 
 export const KIRO_SSO_CACHE_DIR = path.join(os.homedir(), '.aws', 'sso', 'cache')
 export const KIRO_AUTH_TOKEN_PATH = path.join(KIRO_SSO_CACHE_DIR, 'kiro-auth-token.json')
@@ -43,11 +44,26 @@ export const KIRO_SOCIAL_PROFILE_ARN = 'arn:aws:codewhisperer:us-east-1:69947594
 const ENTERPRISE_FALLBACK_PROFILE_ID = 'VNECVYCYYAWN'
 const ENTERPRISE_FALLBACK_ACCOUNT_ID = '610548660232'
 export function getEnterpriseFallbackArn(region?: string): string {
-  const r = region?.startsWith('eu-') ? 'eu-central-1' : 'us-east-1'
+  const r = mapSsoRegionToApiRegion(region)
   return `arn:aws:codewhisperer:${r}:${ENTERPRISE_FALLBACK_ACCOUNT_ID}:profile/${ENTERPRISE_FALLBACK_PROFILE_ID}`
 }
 
 const PLACEHOLDER_PROFILE_ARNS = new Set<string>([KIRO_BUILDER_ID_PLACEHOLDER_ARN])
+
+/**
+ * 账号的 Kiro API 区域（反代流式 / ListAvailableModels / 订阅 / 用量查询统一使用）。
+ * 真实 profileArn 区域优先；BuilderId 占位符、Social 固定 ARN、Enterprise 备用 ARN
+ * 都是多账号共享的兜底值（其区域本身就是按 SSO 区域猜的），不能当作权威区域。
+ */
+const SHARED_PROFILE_ARNS: readonly string[] = [
+  KIRO_BUILDER_ID_PLACEHOLDER_ARN,
+  KIRO_SOCIAL_PROFILE_ARN,
+  getEnterpriseFallbackArn('us-east-1'),
+  getEnterpriseFallbackArn('eu-central-1')
+]
+export function resolveAccountApiRegion(account: { profileArn?: string | null; region?: string | null }): ResolvedRegion {
+  return resolveKiroApiRegion(account, { sharedArns: SHARED_PROFILE_ARNS })
+}
 
 /** 检查给定 ARN 是不是已知占位符（旧版反代 / Kiro IDE 自身可能写入的脏数据） */
 export function isPlaceholderProfileArn(arn: string | undefined | null): boolean {

@@ -18,7 +18,8 @@ import type {
   TokenRefreshCallback
 } from './types'
 import { AccountPool, ErrorType, classifyError } from './accountPool'
-import { callKiroApiStream, callKiroApi, fetchKiroModels, setModelContextWindow, type KiroModel } from './kiroApi'
+import { callKiroApiStream, callKiroApi, fetchKiroModels, setModelContextWindow, type KiroModel, ModelNotAvailableError, isModelNotAvailableError, ensureAccountModelSupport, getCachedAccountModelSupport, mapModelId } from './kiroApi'
+import { findMatchingModel } from './modelSupport'
 import { proxyLogger } from './logger'
 import { getKProxyService, generateDeviceId } from '../kproxy'
 import {
@@ -1041,8 +1042,9 @@ export class ProxyServer {
   // 从模型缓存查找指定模型的 thinking 配置
   private getThinkingConfig(modelId: string): ThinkingConfig | undefined {
     if (!this.modelCache) return undefined
-    const lower = modelId.toLowerCase()
-    const model = this.modelCache.models.find(m => m.modelId.toLowerCase() === lower)
+    // 客户端模型名常带别名形式（claude-opus-4-6 / claude-opus-4.6[1m]），先映射再按家族+版本匹配；
+    // 旧实现只做小写全等，别名一律拿不到 thinking schema，退化成最简 { thinking: adaptive }
+    const model = findMatchingModel(this.modelCache.models, mapModelId(modelId))
     if (!model) return undefined
     const schema = extractThinkingSchema(model.additionalModelRequestFieldsSchema)
     if (!schema?.schemaPath || !schema.efforts?.length) return undefined
@@ -1205,15 +1207,88 @@ export class ProxyServer {
     return new Set(bindings)
   }
 
+  /** 按模型选号时单次请求最多探测的账号数（每个未知账号需一次 ListAvailableModels，5 分钟缓存） */
+  private static readonly MODEL_PROBE_LIMIT = 5
+  private static readonly MODEL_PROBE_TIMEOUT_MS = 5000
+
+  /**
+   * 判断账号是否支持模型：先查缓存，未知时按需拉取模型列表（带超时）。
+   * 返回 undefined 表示无法判断（拉取失败 / 隐藏模型 / CW 内部 ID），不据此排除账号。
+   */
+  private async checkAccountModelSupport(account: ProxyAccount, modelId: string, signal?: AbortSignal): Promise<boolean | undefined> {
+    const cached = getCachedAccountModelSupport(account, modelId)
+    if (cached !== undefined) return cached
+    const timeout = AbortSignal.timeout(ProxyServer.MODEL_PROBE_TIMEOUT_MS)
+    const probeSignal = signal ? AbortSignal.any([signal, timeout]) : timeout
+    try {
+      return await ensureAccountModelSupport(account, modelId, probeSignal)
+    } catch (error) {
+      if (signal?.aborted) throw this.getAbortError(signal)
+      proxyLogger.warn('ProxyServer', `Model probe failed for ${account.email || account.id.slice(0, 8)}: ${(error as Error).message}`)
+      return undefined
+    }
+  }
+
+  /**
+   * 请求处理器用的选号入口：按请求模型选号；所有账号都没有该模型时直接回 400 并返回 undefined
+   * （调用方看到 undefined 直接 return，看到 null 走原来的 503 分支）
+   */
+  private async acquireAccountForRequest(
+    res: http.ServerResponse,
+    path: string,
+    model: string | undefined,
+    startTime: number,
+    signal: AbortSignal | undefined,
+    sessionHint?: string,
+    apiKeyId?: string
+  ): Promise<ProxyAccount | null | undefined> {
+    try {
+      return await this.getAvailableAccount(signal, sessionHint, apiKeyId, model)
+    } catch (error) {
+      if (!isModelNotAvailableError(error)) throw error
+      this.handleApiError(res, { id: '-' }, error as Error, path, model, startTime, signal)
+      return undefined
+    }
+  }
+
   // 获取可用账号（包含 Token 刷新检查）
   // P1-8 sessionHint：相同会话尽量复用同一账号（命中 prompt cache + 防风控）
   // P2-21 apiKeyId：用于过滤 API Key 允许使用的账号子集
-  private async getAvailableAccount(signal?: AbortSignal, sessionHint?: string, apiKeyId?: string): Promise<ProxyAccount | null> {
+  // modelId：多账号模式下只选模型列表里有该模型的账号（混合 Free/Pro 号池时 Opus 请求不会落到没有 Opus 的号上）
+  //   - 所有账号都明确不支持 → 抛 ModelNotAvailableError（调用方返回 400，而不是静默降级）
+  //   - 无法判断（列表拉取失败等）的账号照常参与选号
+  private async getAvailableAccount(signal?: AbortSignal, sessionHint?: string, apiKeyId?: string, modelId?: string): Promise<ProxyAccount | null> {
+    const modelExclude = new Set<string>()
+    if (!modelId || !this.config.enableMultiAccount || this.accountPool.size <= 1) {
+      return this.pickAccount(signal, sessionHint, apiKeyId, modelExclude)
+    }
+    // 缓存里已知不支持的账号直接排除，不花探测次数
+    for (const acc of this.accountPool.getAllAccounts()) {
+      if (getCachedAccountModelSupport(acc, modelId) === false) modelExclude.add(acc.id)
+    }
+    for (let probes = 0; probes < ProxyServer.MODEL_PROBE_LIMIT; probes++) {
+      const account = await this.pickAccount(signal, sessionHint, apiKeyId, modelExclude)
+      if (!account) break
+      const supported = await this.checkAccountModelSupport(account, modelId, signal)
+      if (supported !== false) return account
+      console.log(`[ProxyServer] Account ${account.email || account.id.slice(0, 8)} has no model "${mapModelId(modelId)}", trying next`)
+      modelExclude.add(account.id)
+    }
+    if (modelExclude.size === 0) return null
+    // 探测次数用完：剩下的账号里还有「无法判断」的就交给它；否则所有账号都不支持
+    const fallback = await this.pickAccount(signal, sessionHint, apiKeyId, modelExclude)
+    if (fallback) return fallback
+    throw new ModelNotAvailableError(mapModelId(modelId), '*', [])
+  }
+
+  private async pickAccount(signal: AbortSignal | undefined, sessionHint: string | undefined, apiKeyId: string | undefined, excludeIds: Set<string>): Promise<ProxyAccount | null> {
     const allowedIds = this.getAllowedAccountIds(apiKeyId)
     const groupMode = this.config.multiAccountSelectionMode === 'groups'
     const allowedGroupIds = groupMode ? new Set(this.config.multiAccountGroupIds || []) : null
     const isAllowed = (acc: ProxyAccount | null): boolean => {
       if (!acc) return true
+      // 本次选号的额外排除（按模型选号时不支持该模型的账号）
+      if (excludeIds.has(acc.id)) return false
       // API Key 白名单（apiKeyAccountBindings）
       if (allowedIds && !allowedIds.has(acc.id)) return false
       // 分组过滤（双保险：即便前端忘了重新同步账号池，这里也能拦住非选中分组的账号）
@@ -1303,9 +1378,13 @@ export class ProxyServer {
     if (this.isTokenExpiringSoon(account)) {
       const refreshed = await this.refreshToken(account, signal)
       if (!refreshed) {
-        // 刷新失败，如果启用多账号才尝试获取下一个账号
+        // 刷新失败，如果启用多账号才尝试获取下一个账号（同样受白名单 / 分组 / 模型排除约束）
         if (this.config.enableMultiAccount) {
-          return this.accountPool.getNextAccount()
+          const exclude = new Set<string>([account.id])
+          for (const a of this.accountPool.getAllAccounts()) {
+            if (!isAllowed(a)) exclude.add(a.id)
+          }
+          return this.accountPool.getNextAccount(exclude)
         }
         return null
       }
@@ -1350,7 +1429,8 @@ export class ProxyServer {
     account: ProxyAccount,
     apiCall: (acc: ProxyAccount, endpointIndex: number) => Promise<T>,
     _path: string,
-    signal?: AbortSignal
+    signal?: AbortSignal,
+    modelId?: string
   ): Promise<{ result: T; account: ProxyAccount }> {
     const maxRetries = this.config.maxRetries || 3
     const retryDelay = this.config.retryDelayMs || 1000
@@ -1362,7 +1442,14 @@ export class ProxyServer {
     /** 切到下一个可用账号；多账号模式带 triedIds 排除，单账号场景退化为旧逻辑 */
     const switchToNextAccount = (): ProxyAccount | null => {
       if (this.config.enableMultiAccount) {
-        return this.accountPool.getNextAccount(triedIds)
+        // 同时排除已知不支持本次请求模型的账号，避免切到一个注定 MODEL_NOT_AVAILABLE 的号
+        const exclude = new Set(triedIds)
+        if (modelId) {
+          for (const a of this.accountPool.getAllAccounts()) {
+            if (getCachedAccountModelSupport(a, modelId) === false) exclude.add(a.id)
+          }
+        }
+        return this.accountPool.getNextAccount(exclude)
       }
       if (this.config.autoSwitchOnQuotaExhausted) {
         return this.accountPool.getNextAvailableAccount(triedIds)
@@ -1381,6 +1468,18 @@ export class ProxyServer {
         const errMsg = lastError.message || ''
 
         console.log(`[ProxyServer] API call failed (attempt ${attempt + 1}/${maxRetries}): ${errMsg}`)
+
+        // 账号模型列表里没有请求的模型：不是账号故障，不计错误；多账号模式下切到其它账号
+        if (isModelNotAvailableError(lastError)) {
+          const nextAccount = this.config.enableMultiAccount ? switchToNextAccount() : null
+          if (nextAccount && !triedIds.has(nextAccount.id)) {
+            console.log(`[ProxyServer] Model not available on ${currentAccount.email || currentAccount.id.slice(0, 8)}, switching to ${nextAccount.email || nextAccount.id.slice(0, 8)}`)
+            currentAccount = nextAccount
+            triedIds.add(nextAccount.id)
+            continue
+          }
+          break
+        }
 
         // 优先检测账号被长期封禁（不是 token 问题，刷新也没用）
         // 特征：HTTP 403 + reason: "TEMPORARILY_SUSPENDED" 或 AccountSuspendedException / 423
@@ -1904,6 +2003,12 @@ export class ProxyServer {
           this.isAnthropicPath(path) ? 'anthropic' : 'openai')
         return
       }
+      // 选号阶段发现所有账号都没有请求的模型 → 400（明确告诉客户端，而不是 500 或静默降级）
+      if (isModelNotAvailableError(error)) {
+        this.recordRequestFailed()
+        this.sendError(res, 400, (error as Error).message, this.isAnthropicPath(path) ? 'anthropic' : 'openai')
+        return
+      }
       // P0-5 错误响应 sanitize：500 类不吐内部 message
       console.error('[ProxyServer] Request error:', error)
       this.sendError(res, 500, 'Internal server error', this.isAnthropicPath(path) ? 'anthropic' : 'openai')
@@ -2235,7 +2340,8 @@ export class ProxyServer {
     const startTime = Date.now()
     this.recordNewRequest()
     this.throwIfAborted(signal)
-    const account = await this.getAvailableAccount(signal)
+    const account = await this.acquireAccountForRequest(res, path, openaiRequest.model, startTime, signal, undefined, matchedApiKey?.id)
+    if (account === undefined) return
     this.throwIfAborted(signal)
     if (!account) {
       this.sendError(res, 503, 'No available accounts')
@@ -2300,7 +2406,7 @@ export class ProxyServer {
         })
       } else {
         // 非流式
-        const result = await callKiroApi(account as ProxyAccount, kiroPayload, signal)
+        const result = await callKiroApi(account as ProxyAccount, kiroPayload, signal, this.config.preferredEndpoint)
         this.throwIfResponseClosed(res, signal)
         this.recordRequestSuccess()
         this.stats.totalTokens += result.usage.inputTokens + result.usage.outputTokens
@@ -2379,7 +2485,8 @@ export class ProxyServer {
       buildClientModel({ id: 'claude-sonnet-4.5', created: now, ownedBy: 'kiro-api', description: 'The latest Claude Sonnet model' }),
       buildClientModel({ id: 'claude-sonnet-4', created: now, ownedBy: 'kiro-api', description: 'Hybrid reasoning and coding' }),
       buildClientModel({ id: 'claude-haiku-4.5', created: now, ownedBy: 'kiro-api', description: 'The latest Claude Haiku model' }),
-      buildClientModel({ id: 'claude-opus-4.5', created: now, ownedBy: 'kiro-api', description: 'The most powerful model' })
+      buildClientModel({ id: 'claude-opus-4.5', created: now, ownedBy: 'kiro-api', description: 'Claude Opus 4.5' }),
+      buildClientModel({ id: 'claude-opus-5.5', created: now, ownedBy: 'kiro-api', description: 'The most powerful model' })
     ]
 
     // 隐藏模型（未在官方 ListAvailableModels 中返回，但后端可能支持）
@@ -2518,7 +2625,8 @@ export class ProxyServer {
 
     // 获取账号（包含 Token 刷新检查 + 会话粘性 + API Key 账号白名单）
     this.throwIfAborted(signal)
-    const account = await this.getAvailableAccount(signal, affinityHintChat, matchedApiKey?.id)
+    const account = await this.acquireAccountForRequest(res, '/v1/chat/completions', processedRequest.model, startTime, signal, affinityHintChat, matchedApiKey?.id)
+    if (account === undefined) return
     this.throwIfAborted(signal)
     if (!account) {
       this.recordRequestFailed()
@@ -2574,10 +2682,11 @@ export class ProxyServer {
           account,
           async (acc) => {
             const retryPayload = openaiToKiro(processedRequest, acc.profileArn, toolNameRegistry, thinkingConfig)
-            return callKiroApi(acc, retryPayload, signal)
+            return callKiroApi(acc, retryPayload, signal, this.config.preferredEndpoint)
           },
           '/v1/chat/completions',
-          signal
+          signal,
+          processedRequest.model
         )
         const response = kiroToOpenaiResponse(result.content, result.toolUses, result.usage, request.model, toolNameRegistry, result.reasoningContent)
 
@@ -2638,7 +2747,8 @@ export class ProxyServer {
     }
 
     this.throwIfAborted(signal)
-    const account = await this.getAvailableAccount(signal, affinityHintResp, matchedApiKey?.id)
+    const account = await this.acquireAccountForRequest(res, '/v1/responses', processedRequest.model, startTime, signal, affinityHintResp, matchedApiKey?.id)
+    if (account === undefined) return
     this.throwIfAborted(signal)
     if (!account) {
       this.recordRequestFailed()
@@ -2668,10 +2778,11 @@ export class ProxyServer {
           account,
           async (acc) => {
             const retryPayload = openaiToKiro(processedRequest, acc.profileArn, toolNameRegistry, this.getThinkingConfig(processedRequest.model))
-            return callKiroApi(acc, retryPayload, signal)
+            return callKiroApi(acc, retryPayload, signal, this.config.preferredEndpoint)
           },
           '/v1/responses',
-          signal
+          signal,
+          processedRequest.model
         )
         const chatResponse = kiroToOpenaiResponse(result.content, result.toolUses, result.usage, chatRequest.model, toolNameRegistry, result.reasoningContent)
         this.throwIfResponseClosed(res, signal)
@@ -2720,10 +2831,11 @@ export class ProxyServer {
         account,
         async (acc) => {
           const retryPayload = openaiToKiro(processedRequest, acc.profileArn, toolNameRegistry, this.getThinkingConfig(processedRequest.model))
-          return callKiroApi(acc, retryPayload, signal)
+          return callKiroApi(acc, retryPayload, signal, this.config.preferredEndpoint)
         },
         '/v1/responses',
-        signal
+        signal,
+        processedRequest.model
       )
       const chatResponse = kiroToOpenaiResponse(result.content, result.toolUses, result.usage, chatRequest.model, toolNameRegistry, result.reasoningContent)
       this.throwIfResponseClosed(res, signal)
@@ -2885,7 +2997,10 @@ export class ProxyServer {
 
           this.recordRequestFailed()
           const errStatusCode = error.message.match(/(\d{3})/)?.[1]
-          this.accountPool.recordError(account.id, errStatusCode ? classifyError(parseInt(errStatusCode)) : ErrorType.RECOVERABLE, errStatusCode ? parseInt(errStatusCode) : undefined)
+          // 账号没有该模型不是账号故障，不能让它进入冷却
+          if (!isModelNotAvailableError(error)) {
+            this.accountPool.recordError(account.id, errStatusCode ? classifyError(parseInt(errStatusCode)) : ErrorType.RECOVERABLE, errStatusCode ? parseInt(errStatusCode) : undefined)
+          }
           this.events.onResponse?.({ path: '/v1/chat/completions', model, status: 500, error: error.message })
           this.recordRequest({ path: '/v1/chat/completions', model, accountId: account.id, responseTime: Date.now() - startTime, success: false, error: error.message })
           resolve()
@@ -2942,7 +3057,8 @@ export class ProxyServer {
 
     // 获取账号（包含 Token 刷新检查 + 会话粘性 + API Key 账号白名单）
     this.throwIfAborted(signal)
-    const account = await this.getAvailableAccount(signal, affinityHint, matchedApiKey?.id)
+    const account = await this.acquireAccountForRequest(res, '/v1/messages', processedRequest.model, startTime, signal, affinityHint, matchedApiKey?.id)
+    if (account === undefined) return
     this.throwIfAborted(signal)
     if (!account) {
       this.recordRequestFailed()
@@ -3013,10 +3129,11 @@ export class ProxyServer {
           account,
           async (acc) => {
             const retryPayload = claudeToKiro(processedRequest, acc.profileArn, toolNameRegistry, claudeThinkingConfig)
-            return callKiroApi(acc, retryPayload, signal)
+            return callKiroApi(acc, retryPayload, signal, this.config.preferredEndpoint)
           },
           '/v1/messages',
-          signal
+          signal,
+          processedRequest.model
         )
         const response = kiroToClaudeResponse(result.content, result.toolUses, result.usage, request.model, toolNameRegistry, result.reasoningContent)
 
@@ -3306,7 +3423,10 @@ export class ProxyServer {
 
           this.recordRequestFailed()
           const errStatusCode2 = error.message.match(/(\d{3})/)?.[1]
-          this.accountPool.recordError(account.id, errStatusCode2 ? classifyError(parseInt(errStatusCode2)) : ErrorType.RECOVERABLE, errStatusCode2 ? parseInt(errStatusCode2) : undefined)
+          // 账号没有该模型不是账号故障，不能让它进入冷却
+          if (!isModelNotAvailableError(error)) {
+            this.accountPool.recordError(account.id, errStatusCode2 ? classifyError(parseInt(errStatusCode2)) : ErrorType.RECOVERABLE, errStatusCode2 ? parseInt(errStatusCode2) : undefined)
+          }
           this.events.onResponse?.({ path: '/v1/messages', model, status: 500, error: error.message })
           this.recordRequest({ path: '/v1/messages', model, accountId: account.id, responseTime: Date.now() - startTime, success: false, error: error.message })
           resolve()
@@ -3331,6 +3451,24 @@ export class ProxyServer {
   private handleApiError(res: http.ServerResponse, account: { id: string }, error: Error, path: string, model?: string, startTime?: number, signal?: AbortSignal): void {
     if (this.isAbortError(error, signal) || this.isResponseClosed(res)) return
     this.recordRequestFailed()
+    // 模型不可用是请求问题（400），不记为账号错误；也不能走下面的「从 message 里抠 3 位数字」
+    // （CW 模型 ID 带日期，如 20250514，会被误解析成状态码 202）
+    if (isModelNotAvailableError(error)) {
+      const message = error.message
+      if (res.headersSent) {
+        if (!this.isResponseClosed(res)) {
+          if (path === '/v1/responses' || path === '/responses') {
+            res.write(`event: response.failed\ndata: ${JSON.stringify({ type: 'response.failed', error: { type: 'invalid_request_error', message } })}\n\n`)
+          }
+          res.end()
+        }
+      } else {
+        this.sendError(res, 400, message, this.isAnthropicPath(path) ? 'anthropic' : 'openai')
+      }
+      this.events.onResponse?.({ path, model, status: 400, error: message })
+      this.recordRequest({ path, model, accountId: account.id, responseTime: startTime ? Date.now() - startTime : 0, success: false, error: message })
+      return
+    }
     const errCode = error.message.match(/(\d{3})/)?.[1]
     const parsedCode = errCode ? parseInt(errCode) : 500
     const errorType = classifyError(parsedCode)

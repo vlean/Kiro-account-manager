@@ -2,6 +2,7 @@ import { constants, existsSync } from 'fs'
 import { access, copyFile, mkdir, readFile, writeFile } from 'fs/promises'
 import { dirname, join } from 'path'
 import { homedir } from 'os'
+import { pickLatestModelId } from './modelSupport'
 
 export type ProxyClientTarget = 'claudeCode' | 'opencode' | 'codex' | 'gemini' | 'hermes' | 'openclaw'
 type OpenCodeInputModality = 'text' | 'image' | 'pdf'
@@ -241,8 +242,10 @@ async function configureClaudeCode(context: ProxyClientContext): Promise<Omit<Pr
   env.ANTHROPIC_API_KEY = context.apiKey
   env.ANTHROPIC_MODEL = context.modelId
   // 默认模型映射：让 Claude Code 的 haiku/opus/sonnet 快捷调用都走代理支持的模型
-  const haikuModel = context.models.find(m => m.id.toLowerCase().includes('haiku'))?.id || 'claude-haiku-4.5'
-  const opusModel = context.models.find(m => m.id.toLowerCase().includes('opus'))?.id || context.modelId
+  // 按版本号取各家族最新模型（旧实现取列表中第一个包含 opus 的，可能是 4.5 而不是 5.5）
+  const modelIds = context.models.map(m => m.id)
+  const haikuModel = pickLatestModelId(modelIds, 'haiku') || 'claude-haiku-4.5'
+  const opusModel = pickLatestModelId(modelIds, 'opus') || context.modelId
   env.ANTHROPIC_DEFAULT_HAIKU_MODEL = haikuModel
   env.ANTHROPIC_DEFAULT_OPUS_MODEL = opusModel
   env.ANTHROPIC_DEFAULT_SONNET_MODEL = context.modelId

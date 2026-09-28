@@ -143,29 +143,40 @@ async function fetchWithProxy(url: string, options: RequestInit, account?: Proxy
   return await fetch(url, options)
 }
 
-// Kiro API 端点配置
+// Kiro API 端点配置（URL 按账号 API 区域动态生成，见 buildEndpointUrl）
+// 旧实现把三个流式端点都写死在 us-east-1，EU profile 的账号会被打到错误区域
 const KIRO_ENDPOINTS = [
   {
-    url: 'https://codewhisperer.us-east-1.amazonaws.com/generateAssistantResponse',
+    host: 'codewhisperer' as const,
+    path: '/generateAssistantResponse',
     origin: 'AI_EDITOR',
     amzTarget: 'AmazonCodeWhispererStreamingService.GenerateAssistantResponse',
     name: 'CodeWhisperer',
     protocol: 'generateAssistantResponse' as const
   },
   {
-    url: 'https://q.us-east-1.amazonaws.com/generateAssistantResponse',
+    host: 'q' as const,
+    path: '/generateAssistantResponse',
     origin: 'AI_EDITOR',
     amzTarget: 'AmazonCodeWhispererStreamingService.GenerateAssistantResponse',
     name: 'AmazonQ',
     protocol: 'generateAssistantResponse' as const
   },
   {
-    url: 'https://q.us-east-1.amazonaws.com/SendMessageStreaming',
+    host: 'q' as const,
+    path: '/SendMessageStreaming',
     origin: 'CLI',
     amzTarget: 'AmazonQDeveloperStreamingService.SendMessage',
     name: 'AmazonQCLI'
   }
 ]
+
+type KiroEndpoint = typeof KIRO_ENDPOINTS[number]
+
+function buildEndpointUrl(endpoint: KiroEndpoint, region: string): string {
+  const base = endpoint.host === 'codewhisperer' ? getCodeWhispererBaseUrl(region) : getQServiceBaseUrl(region)
+  return `${base}${endpoint.path}`
+}
 
 // Kiro 版本号（跟随官方 IDE 更新）
 const KIRO_VERSION = '0.12.155'
@@ -206,8 +217,26 @@ import {
   KIRO_BUILDER_ID_PLACEHOLDER_ARN as _KIRO_BUILDER_ID_PLACEHOLDER_ARN,
   KIRO_SOCIAL_PROFILE_ARN,
   isPlaceholderProfileArn as _isPlaceholderProfileArn,
-  getEnterpriseFallbackArn
+  getEnterpriseFallbackArn,
+  resolveAccountApiRegion
 } from '../kiroAuthSync'
+import {
+  accountSupportsModel,
+  findMatchingModel,
+  getHiddenModelCodeWhispererId,
+  isCodeWhispererModelId,
+  isHiddenModel,
+  normalizeClaudeVersion,
+  stripContextSuffix
+} from './modelSupport'
+import {
+  getAlternateApiRegion,
+  getCodeWhispererBaseUrl,
+  getQServiceBaseUrl,
+  parseRegionFromArn,
+  shouldTryAlternateRegion,
+  type ResolvedRegion
+} from '../regionResolver'
 
 export const KIRO_BUILDER_ID_PLACEHOLDER_ARN = _KIRO_BUILDER_ID_PLACEHOLDER_ARN
 export const isPlaceholderProfileArn = _isPlaceholderProfileArn
@@ -267,10 +296,14 @@ const THINKING_MODE_PROMPT = `<thinking_mode>enabled</thinking_mode>
 const CODEWHISPERER_DEFAULT_MODEL_ID = 'CLAUDE_SONNET_4_20250514_V1_0'
 const CODEWHISPERER_MODEL_CACHE_TTL = 5 * 60 * 1000
 
+// 仅缓存「完整」的模型列表（所有分页成功）；失败/半截列表不缓存，避免把网络抖动误判成账号不支持模型
 const codeWhispererModelCache = new Map<string, { models: KiroModel[]; timestamp: number }>()
 
 // 模型 ID 映射
 const MODEL_ID_MAP: Record<string, string> = {
+  // Claude 5.x 系列
+  'claude-opus-5-5': 'claude-opus-5.5',
+  'claude-opus-5.5': 'claude-opus-5.5',
   // Claude 4.5 系列
   'claude-sonnet-4-5': 'claude-sonnet-4.5',
   'claude-sonnet-4.5': 'claude-sonnet-4.5',
@@ -294,37 +327,25 @@ const MODEL_ID_MAP: Record<string, string> = {
   'default': 'claude-sonnet-4.5'
 }
 
-/**
- * 归一化 Claude 版本号：把版本号里的短横线转成点号。
- *
- * 背景：部分客户端（如 Claude Code）不允许模型名里出现 "."，会把 "claude-opus-4.6"
- * 写成 "claude-opus-4-6"，若原样透传给 Kiro 会被解析成 "claude-opus-4"（丢掉 minor），
- * 导致 1M 上下文等特性设置失败。这里把 claude-{family}-{major}-{minor} 的最后一段
- * 版本短横转成点号，兼容未来任意新版本（4.6 / 4.7 / 5.0 ...）。
- *
- * 仅当 minor 是 1~2 位数字且其后不是更多数字时才转换，避免误伤日期快照后缀
- * （如 claude-sonnet-4-20250514 不会被改）。
- */
-function normalizeClaudeVersion(modelId: string): string {
-  return modelId.replace(
-    /^(claude-(?:sonnet|haiku|opus))-(\d+)-(\d{1,2})(?=$|[^\d])/i,
-    '$1-$2.$3'
-  )
-}
-
 export function mapModelId(model: string): string {
   let modelId = model.trim()
   if (!modelId) return MODEL_ID_MAP.default
   if (isCodeWhispererModelId(modelId)) return modelId
-  // 0) 归一化版本号短横 → 点号（claude-opus-4-6 → claude-opus-4.6），兼容不支持 "." 的客户端
+  // 0) 剥离 Claude Code 的 [1m] 上下文后缀（Kiro 后端不认识，原样透传会 400）
+  const stripped = stripContextSuffix(modelId)
+  if (stripped.base !== modelId) {
+    console.log(`[Kiro API] Model "${modelId}" → stripped context suffix → "${stripped.base}"`)
+    modelId = stripped.base
+  }
+  // 1) 归一化版本号短横 → 点号（claude-opus-4-6 → claude-opus-4.6），兼容不支持 "." 的客户端
   modelId = normalizeClaudeVersion(modelId)
   const lower = modelId.toLowerCase()
-  // 1) 显式 alias 映射优先
+  // 2) 显式 alias 映射优先
   if (MODEL_ID_MAP[lower]) return MODEL_ID_MAP[lower]
-  // 2) 看似 Kiro 支持的 Claude 模型格式 (claude-{sonnet|haiku|opus}-{ver})，原样透传
+  // 3) 看似 Kiro 支持的 Claude 模型格式 (claude-{sonnet|haiku|opus}-{ver})，原样透传
   //    用于向前兼容尚未加入 MODEL_ID_MAP 的新发布模型
   if (/^claude-(sonnet|haiku|opus)-/.test(lower)) return modelId
-  // 3) 完全未知的 model（用户拼错/不存在），兜底到 default 避免直接 400
+  // 4) 完全未知的 model（用户拼错/不存在），兜底到 default 避免直接 400
   console.warn(`[Kiro API] Unknown model "${modelId}" → fallback to "${MODEL_ID_MAP.default}"`)
   return MODEL_ID_MAP.default
 }
@@ -333,51 +354,61 @@ function clonePayload(payload: KiroPayload): KiroPayload {
   return JSON.parse(JSON.stringify(payload)) as KiroPayload
 }
 
-function normalizeModelKey(value: string): string {
-  return value.toLowerCase().replace(/[^a-z0-9]+/g, '')
-}
-
-function modelTokens(value: string): string[] {
-  return value.toLowerCase().split(/[^a-z0-9]+/).filter(Boolean)
-}
-
-function matchesRequestedModel(model: KiroModel, requestedModelId: string): boolean {
-  // 1. modelId 级精确匹配（去除符号后比较）
-  const requestedKey = normalizeModelKey(requestedModelId)
-  const modelIdKey = normalizeModelKey(model.modelId)
-  if (modelIdKey === requestedKey || modelIdKey.includes(requestedKey)) return true
-  // 2. modelName 精确匹配
-  if (model.modelName && normalizeModelKey(model.modelName).includes(requestedKey)) return true
-  // 3. token 匹配（所有请求 token 必须在 modelId+modelName 中命中，不搜索 description 避免误匹配）
-  const tokens = modelTokens(requestedModelId).filter(token => token !== 'latest' && token !== 'model')
-  if (tokens.length === 0) return false
-  const candidateTokens = new Set(modelTokens(`${model.modelId} ${model.modelName || ''}`))
-  // 必须全部 token 命中
-  if (!tokens.every(token => candidateTokens.has(token))) return false
-  // 防止模型家族冲突：如果请求包含 opus/sonnet/haiku，候选必须也包含对应的
-  const families = ['opus', 'sonnet', 'haiku']
-  for (const family of families) {
-    if (tokens.includes(family) && !candidateTokens.has(family)) return false
-    if (!tokens.includes(family) && candidateTokens.has(family)) return false
+/**
+ * 账号的模型列表中没有请求的模型。
+ * 旧实现静默降级为 CLAUDE_SONNET_4（客户端要 Opus 实际拿到 Sonnet 4，统计还记成 Opus）；
+ * 现在显式抛出，由 proxyServer 标记后切到支持该模型的账号，全都不支持则返回 400 给客户端。
+ */
+export class ModelNotAvailableError extends Error {
+  readonly code = 'MODEL_NOT_AVAILABLE'
+  constructor(
+    readonly requestedModelId: string,
+    readonly accountId: string,
+    readonly availableModelIds: string[]
+  ) {
+    super(`MODEL_NOT_AVAILABLE: model "${requestedModelId}" is not available for this account (available: ${availableModelIds.slice(0, 12).join(', ') || 'none'})`)
+    this.name = 'ModelNotAvailableError'
   }
-  return true
 }
 
-function isCodeWhispererModelId(modelId: string): boolean {
-  return /^[A-Z0-9_]+$/.test(modelId) && modelId.includes('_')
+export function isModelNotAvailableError(error: unknown): error is ModelNotAvailableError {
+  return error instanceof ModelNotAvailableError
+    || (error instanceof Error && error.message.includes('MODEL_NOT_AVAILABLE'))
 }
 
 function getModelCacheKey(account: ProxyAccount): string {
-  return `${account.id}:${account.region || 'us-east-1'}:${resolveProfileArn(account) ?? 'no-arn'}`
+  return `${account.id}:${getAccountApiRegion(account).region}:${resolveProfileArn(account) ?? 'no-arn'}`
+}
+
+function getFreshCachedModels(account: ProxyAccount): KiroModel[] | undefined {
+  const cached = codeWhispererModelCache.get(getModelCacheKey(account))
+  if (cached && Date.now() - cached.timestamp < CODEWHISPERER_MODEL_CACHE_TTL) return cached.models
+  return undefined
 }
 
 async function getCachedCodeWhispererModels(account: ProxyAccount, signal?: AbortSignal): Promise<KiroModel[]> {
-  const key = getModelCacheKey(account)
-  const cached = codeWhispererModelCache.get(key)
-  if (cached && Date.now() - cached.timestamp < CODEWHISPERER_MODEL_CACHE_TTL) return cached.models
-  const models = await fetchKiroModels(account, signal)
-  codeWhispererModelCache.set(key, { models, timestamp: Date.now() })
+  const cached = getFreshCachedModels(account)
+  if (cached) return cached
+  const { models, complete } = await fetchKiroModelsDetailed(account, signal)
+  // 注意 key 要在 fetch 之后计算：fetch 内部可能自愈写入 profileArn
+  if (complete && models.length > 0) {
+    codeWhispererModelCache.set(getModelCacheKey(account), { models, timestamp: Date.now() })
+  }
   return models
+}
+
+/** 仅查缓存判断账号是否支持模型（不发请求）；undefined = 未知 */
+export function getCachedAccountModelSupport(account: ProxyAccount, modelId: string | undefined): boolean | undefined {
+  return accountSupportsModel(getFreshCachedModels(account), modelId && mapModelId(modelId))
+}
+
+/** 按需拉取（5 分钟缓存）后判断账号是否支持模型；拉取失败 / 列表不完整返回 undefined */
+export async function ensureAccountModelSupport(account: ProxyAccount, modelId: string | undefined, signal?: AbortSignal): Promise<boolean | undefined> {
+  if (!modelId) return undefined
+  const mapped = mapModelId(modelId)
+  if (isCodeWhispererModelId(mapped) || isHiddenModel(mapped)) return undefined // 不在模型列表里，无法判断
+  await getCachedCodeWhispererModels(account, signal)
+  return accountSupportsModel(getFreshCachedModels(account), mapped)
 }
 
 async function resolveCodeWhispererModelId(account: ProxyAccount, requestedModelId?: string, signal?: AbortSignal): Promise<string> {
@@ -385,7 +416,17 @@ async function resolveCodeWhispererModelId(account: ProxyAccount, requestedModel
   if (!modelId) return CODEWHISPERER_DEFAULT_MODEL_ID
   if (isCodeWhispererModelId(modelId)) return modelId
   const models = await getCachedCodeWhispererModels(account, signal)
-  return models.find(model => matchesRequestedModel(model, modelId))?.modelId || CODEWHISPERER_DEFAULT_MODEL_ID
+  const matched = findMatchingModel(models, modelId)
+  if (matched) return matched.modelId
+  // 隐藏模型（不在 ListAvailableModels 中）→ 映射到其 CW 内部 ID
+  const hiddenId = getHiddenModelCodeWhispererId(modelId)
+  if (hiddenId) return hiddenId
+  // 模型列表未知（拉取失败 / 为空）→ 原样透传，让后端给出真实错误，而不是偷偷换成 Sonnet 4
+  if (!getFreshCachedModels(account)) {
+    console.warn(`[KiroAPI] Model list unavailable for ${account.email || account.id}, passing "${modelId}" through as-is`)
+    return modelId
+  }
+  throw new ModelNotAvailableError(modelId, account.id, models.map(m => m.modelId))
 }
 
 function getPayloadModelId(payload: KiroPayload): string | undefined {
@@ -1178,7 +1219,7 @@ function getAccountMachineId(accountId: string, accountMachineId?: string): stri
 }
 
 // 获取认证方式对应的请求头
-function getAuthHeaders(account: ProxyAccount, _endpoint: typeof KIRO_ENDPOINTS[0]): Record<string, string> {
+function getAuthHeaders(account: ProxyAccount, _endpoint: KiroEndpoint): Record<string, string> {
   const machineId = getAccountMachineId(account.id, account.machineId)
   // 按配置的 agent 模式（vibe 或 spec）设置 header
   const agentMode = configuredAgentMode
@@ -1202,7 +1243,7 @@ function getAuthHeaders(account: ProxyAccount, _endpoint: typeof KIRO_ENDPOINTS[
 }
 
 // 获取排序后的端点列表（根据首选端点配置）
-function getSortedEndpoints(preferredEndpoint?: 'codewhisperer' | 'amazonq' | 'amazonq-cli'): typeof KIRO_ENDPOINTS {
+function getSortedEndpoints(preferredEndpoint?: 'codewhisperer' | 'amazonq' | 'amazonq-cli'): KiroEndpoint[] {
   if (!preferredEndpoint) return KIRO_ENDPOINTS.filter(ep => ep.name !== 'AmazonQCLI')
   
   // AmazonQ CLI 模式：只用这一个端点，失败不回退
@@ -1257,6 +1298,36 @@ export async function callKiroApiStream(
   }
 
   let lastError: Error | null = null
+  // 区域在 profileArn 自愈之后决策（真实 ARN 才是权威区域）
+  const apiRegion = getAccountApiRegion(account)
+  const alternateRegion = shouldTryAlternateRegion(apiRegion) ? getAlternateApiRegion(apiRegion.region) : undefined
+
+  /** 发一次流式请求；403 且区域是猜的（非 ARN）时换另一个部署区域重试一次 */
+  const postStream = async (endpoint: KiroEndpoint, headers: Record<string, string>, body: string): Promise<Response> => {
+    const send = async (region: string): Promise<Response> => {
+      const url = buildEndpointUrl(endpoint, region)
+      const agent = getNetworkAgent(account)
+      if (agent) proxyLogger.debug('KiroAPI', `Stream request via proxy to ${endpoint.name} (${region})`)
+      return agent
+        ? await undiciFetch(url, { method: 'POST', headers, body, signal, dispatcher: agent } as UndiciRequestInit) as unknown as Response
+        : await fetch(url, { method: 'POST', headers, body, signal })
+    }
+    const response = await send(apiRegion.region)
+    if (response.status !== 403 || !alternateRegion) return response
+    const errBody = await response.text().catch(() => '')
+    // 封禁 / token 失效与区域无关，跨区重试没有意义，原样交给上层处理
+    if (/SUSPENDED|AccountSuspended|token/i.test(errBody)) {
+      return new Response(errBody, { status: response.status, statusText: response.statusText })
+    }
+    console.warn(`[KiroAPI] ${endpoint.name} 403 in ${apiRegion.region} (region from ${apiRegion.source}), retrying in ${alternateRegion}`)
+    throwIfAborted(signal)
+    const retried = await send(alternateRegion)
+    if (retried.status === 403) {
+      await retried.body?.cancel().catch(() => undefined)
+      return new Response(errBody, { status: response.status, statusText: response.statusText })
+    }
+    return retried
+  }
 
   for (const endpoint of endpoints) {
     try {
@@ -1287,7 +1358,7 @@ export async function callKiroApiStream(
       const historyMessages = requestPayload.conversationState.history ?? []
       const historyToolUseCount = historyMessages.reduce((count, message) => count + (message.assistantResponseMessage?.toolUses?.length ?? 0), 0)
       const historyToolResultCount = historyMessages.reduce((count, message) => count + (message.userInputMessage?.userInputMessageContext?.toolResults?.length ?? 0), 0)
-      console.log(`[KiroAPI] Request to ${endpoint.name}:`)
+      console.log(`[KiroAPI] Request to ${endpoint.name} (${apiRegion.region}, region from ${apiRegion.source}):`)
       console.log(`[KiroAPI]   - Content length: ${currentUserInput?.content?.length || 0}`)
       console.log(`[KiroAPI]   - Tools count: ${currentUserInput?.userInputMessageContext?.tools?.length || 0}`)
       console.log(`[KiroAPI]   - Current tool results: ${currentUserInput?.userInputMessageContext?.toolResults?.length || 0}`)
@@ -1298,11 +1369,7 @@ export async function callKiroApiStream(
       console.log(`[KiroAPI]   - Agent mode: ${headers['x-amzn-kiro-agent-mode']}`)
       console.log(`[KiroAPI]   - Payload size: ${payloadStr.length} bytes`)
       
-      const agent = getNetworkAgent(account)
-      if (agent) proxyLogger.debug('KiroAPI', `Stream request via proxy to ${endpoint.name}`)
-      const response = agent
-        ? await undiciFetch(endpoint.url, { method: 'POST', headers, body: payloadStr, signal, dispatcher: agent } as UndiciRequestInit) as unknown as Response
-        : await fetch(endpoint.url, { method: 'POST', headers, body: payloadStr, signal })
+      const response = await postStream(endpoint, headers, payloadStr)
 
       if (response.status === 429) {
         console.log(`[KiroAPI] Endpoint ${endpoint.name} quota exhausted, trying next...`)
@@ -1337,6 +1404,12 @@ export async function callKiroApiStream(
       lastError = error as Error
       console.error(`[KiroAPI] Endpoint ${endpoint.name} failed:`, error)
       
+      // 账号不支持该模型：换端点也没用（AmazonQ 端点会把别名原样发给同一个账号），交给上层切号
+      if (isModelNotAvailableError(error)) {
+        onError(error as Error)
+        return
+      }
+
       // 如果是认证错误，不继续尝试其他端点
       if ((error as Error).message.includes('Auth error')) {
         onError(error as Error)
@@ -1371,10 +1444,7 @@ export async function callKiroApiStream(
           applyPayloadOrigin(retryPayload, endpoint.origin)
           const retryStr = JSON.stringify(retryPayload)
           const retryHeaders = getAuthHeaders(account, endpoint)
-          const retryAgent = getNetworkAgent(account)
-          const retryResponse = retryAgent
-            ? await undiciFetch(endpoint.url, { method: 'POST', headers: retryHeaders, body: retryStr, signal, dispatcher: retryAgent } as UndiciRequestInit) as unknown as Response
-            : await fetch(endpoint.url, { method: 'POST', headers: retryHeaders, body: retryStr, signal })
+          const retryResponse = await postStream(endpoint, retryHeaders, retryStr)
           if (retryResponse.ok) {
             await parseEventStream(retryResponse.body!, onChunk, onComplete, onError, retryStr.length, signal, getPayloadModelId(retryPayload), retryStr)
             return
@@ -2165,7 +2235,8 @@ async function parseEventStream(
 export async function callKiroApi(
   account: ProxyAccount,
   payload: KiroPayload,
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  preferredEndpoint?: 'codewhisperer' | 'amazonq' | 'amazonq-cli'
 ): Promise<{
   content: string
   toolUses: KiroToolUse[]
@@ -2208,7 +2279,8 @@ export async function callKiroApi(
         resolve({ content, toolUses, usage })
       },
       reject,
-      signal
+      signal,
+      preferredEndpoint
     ).catch(reject)
   })
 }
@@ -2236,16 +2308,23 @@ export interface KiroModel {
   availableOrigins?: string[] | null
 }
 
+/**
+ * 账号 API 区域：真实 profileArn 区域优先，其次 SSO 区域映射（见 regionResolver）。
+ * 反代流式端点、ListAvailableModels、订阅接口共用，保证同一账号所有请求落在同一区域。
+ */
+function getAccountApiRegion(account: ProxyAccount): ResolvedRegion {
+  return resolveAccountApiRegion({ profileArn: account.profileArn, region: account.region })
+}
+
 // 根据账号区域获取 Q Service 端点（官方插件使用 q.{region}.amazonaws.com）
-function getQServiceEndpoint(region?: string): string {
-  if (region?.startsWith('eu-')) return 'https://q.eu-central-1.amazonaws.com'
-  return 'https://q.us-east-1.amazonaws.com'
+function getQServiceEndpoint(account: ProxyAccount): string {
+  return getQServiceBaseUrl(getAccountApiRegion(account).region)
 }
 
 // 根据账号区域获取 CodeWhisperer Runtime 端点
-function getCodeWhispererEndpoint(region?: string): string {
-  if (region?.startsWith('eu-')) return 'https://codewhisperer.eu-central-1.amazonaws.com'
-  return 'https://codewhisperer.us-east-1.amazonaws.com'
+// ListAvailableProfiles 在拿到 profileArn 之前调用，只能按 SSO 区域决策
+function getCodeWhispererEndpoint(account: ProxyAccount): string {
+  return getCodeWhispererBaseUrl(resolveAccountApiRegion({ region: account.region }).region)
 }
 
 /**
@@ -2254,7 +2333,7 @@ function getCodeWhispererEndpoint(region?: string): string {
  * 反代自动取第一个 profile。
  */
 export async function fetchEnterpriseProfileArn(account: ProxyAccount): Promise<string | undefined> {
-  const baseUrl = getCodeWhispererEndpoint(account.region)
+  const baseUrl = getCodeWhispererEndpoint(account)
   const url = `${baseUrl}/ListAvailableProfiles`
   const machineId = getAccountMachineId(account.id, account.machineId)
 
@@ -2295,7 +2374,13 @@ export async function fetchEnterpriseProfileArn(account: ProxyAccount): Promise<
       return undefined
     }
 
-    const arn = profiles[0].arn
+    // 多 profile 时优先选与账号 SSO 区域对应部署区域的 profile（旧实现无条件取第一个）
+    const preferredRegion = resolveAccountApiRegion({ region: account.region }).region
+    const preferred = profiles.find(p => p.arn && parseRegionFromArn(p.arn) === preferredRegion)
+    const arn = (preferred || profiles.find(p => p.arn))?.arn
+    if (profiles.length > 1) {
+      console.log(`[KiroAPI] ListAvailableProfiles returned ${profiles.length} profiles, picked ${arn} (preferred region ${preferredRegion})`)
+    }
     if (arn) {
       console.log(`[KiroAPI] Enterprise profileArn resolved: ${arn}`)
     }
@@ -2308,7 +2393,14 @@ export async function fetchEnterpriseProfileArn(account: ProxyAccount): Promise<
 
 // 获取 Kiro 官方模型列表（支持分页，与官方插件一致传递 profileArn）
 export async function fetchKiroModels(account: ProxyAccount, signal?: AbortSignal): Promise<KiroModel[]> {
-  const baseUrl = getQServiceEndpoint(account.region)
+  return (await fetchKiroModelsDetailed(account, signal)).models
+}
+
+/**
+ * 同 fetchKiroModels，额外返回 complete：所有分页都成功拉到才为 true。
+ * 按模型选号只信任完整列表——半截列表会把「翻页失败」误判为「账号不支持该模型」。
+ */
+export async function fetchKiroModelsDetailed(account: ProxyAccount, signal?: AbortSignal): Promise<{ models: KiroModel[]; complete: boolean }> {
   const machineId = getAccountMachineId(account.id, account.machineId)
   
   const headers: Record<string, string> = {
@@ -2333,8 +2425,15 @@ export async function fetchKiroModels(account: ProxyAccount, signal?: AbortSigna
     }
   }
 
+  // 区域在 profileArn 自愈之后决策
+  const apiRegion = getAccountApiRegion(account)
+  let region = apiRegion.region
+  let triedAlternate = !shouldTryAlternateRegion(apiRegion)
+
   try {
-    do {
+    // 注意：用 for(;;) 而不是 do/while —— 跨区重试需要 continue 回到首页，
+    // do/while 的 continue 会先判断 while(nextToken)（首页时为空）直接退出
+    for (;;) {
       const params = new URLSearchParams({ origin: 'AI_EDITOR', maxResults: '50' })
       const arnForModels = resolveProfileArn(account)
       // profileArn 决策由 resolveProfileArn 统一处理：
@@ -2344,27 +2443,36 @@ export async function fetchKiroModels(account: ProxyAccount, signal?: AbortSigna
       if (arnForModels) params.set('profileArn', arnForModels)
       if (nextToken) params.set('nextToken', nextToken)
 
-      const url = `${baseUrl}/ListAvailableModels?${params.toString()}`
+      const url = `${getQServiceBaseUrl(region)}/ListAvailableModels?${params.toString()}`
       throwIfAborted(signal)
       const response = await fetchWithProxy(url, { method: 'GET', headers, signal }, account)
       throwIfAborted(signal)
       
       if (!response.ok) {
         const errBody = await response.text().catch(() => '')
-        console.error(`[KiroAPI] ListAvailableModels failed: ${response.status}`, errBody.slice(0, 300))
-        break
+        console.error(`[KiroAPI] ListAvailableModels failed (${region}): ${response.status}`, errBody.slice(0, 300))
+        // 首页 403 且区域是猜的 → 换另一个部署区域再试一次（与 GetUsageLimits 的 fallback 策略一致）
+        const alternate = getAlternateApiRegion(region)
+        if (response.status === 403 && !triedAlternate && allModels.length === 0 && alternate) {
+          triedAlternate = true
+          region = alternate
+          console.warn(`[KiroAPI] ListAvailableModels retrying in ${region}`)
+          continue
+        }
+        return { models: allModels, complete: false }
       }
 
       const data = await response.json()
       allModels.push(...(data.models || []))
       nextToken = data.nextToken
-    } while (nextToken)
+      if (!nextToken) break
+    }
 
-    return allModels
+    return { models: allModels, complete: true }
   } catch (error) {
     if (signal?.aborted) throw getAbortError(signal)
     console.error('[KiroAPI] ListAvailableModels error:', error)
-    return allModels.length > 0 ? allModels : []
+    return { models: allModels, complete: false }
   }
 }
 
@@ -2405,7 +2513,7 @@ function getSubscriptionAmzUserAgent(machineId?: string): string {
 
 // 获取可用订阅列表
 export async function fetchAvailableSubscriptions(account: ProxyAccount): Promise<SubscriptionListResponse> {
-  const baseUrl = getQServiceEndpoint(account.region)
+  const baseUrl = getQServiceEndpoint(account)
   const url = `${baseUrl}/listAvailableSubscriptions`
   const machineId = getAccountMachineId(account.id, account.machineId)
   
@@ -2455,7 +2563,7 @@ export async function fetchSubscriptionToken(
   account: ProxyAccount,
   subscriptionType?: string
 ): Promise<SubscriptionTokenResponse> {
-  const baseUrl = getQServiceEndpoint(account.region)
+  const baseUrl = getQServiceEndpoint(account)
   const url = `${baseUrl}/CreateSubscriptionToken`
   const machineId = getAccountMachineId(account.id, account.machineId)
   
@@ -2504,7 +2612,7 @@ export async function setUserPreference(
   account: ProxyAccount,
   overageStatus: 'ENABLED' | 'DISABLED'
 ): Promise<{ success: boolean; error?: string }> {
-  const baseUrl = getQServiceEndpoint(account.region)
+  const baseUrl = getQServiceEndpoint(account)
   const url = `${baseUrl}/setUserPreference`
   const machineId = getAccountMachineId(account.id, account.machineId)
 

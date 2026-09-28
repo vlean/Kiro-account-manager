@@ -4,6 +4,7 @@
  * 以便从 Kiro 后端的 contextUsagePercentage 反推真实 input tokens。
  */
 import { getEncoding, type Tiktoken } from 'js-tiktoken'
+import { guessClaudeContextLength } from './modelSupport'
 
 let encoder: Tiktoken | null = null
 let encoderInitFailed = false
@@ -113,8 +114,10 @@ export function getModelContextLength(modelId: string | undefined | null): numbe
   // 3. 关键词匹配兜底（首次请求 cache 未填充时使用）
   const id = modelId.toLowerCase()
 
-  // Claude 系列（默认 200K）
-  if (id.includes('claude-opus-4') || id.includes('claude-sonnet-4') || id.includes('claude-haiku-4')) return 200000
+  // Claude 系列：任意版本（含 5.x）默认 200K；Claude Code 的 [1m] 后缀 → 1M
+  // 旧实现只匹配 -4 系列，claude-opus-5.5 会落到文件末尾的通用兜底
+  const claudeCtx = guessClaudeContextLength(modelId)
+  if (claudeCtx) return claudeCtx
   if (id.includes('claude-3-7') || id.includes('claude-3.7')) return 200000
   if (id.includes('claude-3-5') || id.includes('claude-3.5')) return 200000
   if (id.includes('claude-3')) return 200000

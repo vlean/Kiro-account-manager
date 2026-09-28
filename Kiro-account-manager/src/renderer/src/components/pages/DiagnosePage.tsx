@@ -15,6 +15,7 @@ const LIVENESS_MODELS = [
   'claude-sonnet-4',
   'claude-haiku-4.5',
   'claude-opus-4.5',
+  'claude-opus-5.5',
   'claude-3.7-sonnet',
   'auto'
 ]
